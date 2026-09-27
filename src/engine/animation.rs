@@ -418,8 +418,8 @@ impl Scene {
         resolve_color_code(color, self.no_color, self.use_xterm_colors, None)
     }
 
-    /// Scene.add_frame with the preexisting-color/bold overrides.
-    pub fn add_frame(&mut self, symbol: &str, duration: i64, mut params: VisualParams) -> Result<(), String> {
+    /// Resolve styling once when multiple frames can reuse the same visual.
+    pub(crate) fn frame_visual(&self, symbol: &str, mut params: VisualParams) -> Rc<CharacterVisual> {
         if let Some(pre) = &self.preexisting_colors {
             params.colors = Some(pre.clone());
         }
@@ -433,10 +433,21 @@ impl Scene {
             params.fg_color_code = None;
             params.bg_color_code = None;
         }
+        CharacterVisual::shared(symbol, params)
+    }
+
+    /// Scene.add_frame with the preexisting-color/bold overrides.
+    pub fn add_frame(&mut self, symbol: &str, duration: i64, params: VisualParams) -> Result<(), String> {
         if duration < 1 {
             return Err(format!("Frame duration must be at least 1. Received: {duration}"));
         }
-        let visual = CharacterVisual::shared(symbol, params);
+        self.add_frame_visual(self.frame_visual(symbol, params), duration)
+    }
+
+    pub(crate) fn add_frame_visual(&mut self, visual: Rc<CharacterVisual>, duration: i64) -> Result<(), String> {
+        if duration < 1 {
+            return Err(format!("Frame duration must be at least 1. Received: {duration}"));
+        }
         let frame_index = self.all_frames.len();
         self.all_frames.push(Frame { character_visual: visual, duration, ticks_elapsed: 0 });
         self.frames.push_back(frame_index);

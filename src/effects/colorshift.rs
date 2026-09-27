@@ -1,14 +1,15 @@
 //! colorshift, ported from effects/effect_colorshift.py.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use clap::Args;
 
 use crate::cli::parse_color;
 use crate::effects::common::{parse_gradient_direction, parse_gradient_steps, parse_positive_int};
-use crate::engine::animation::{ExistingColorHandling, VisualParams};
+use crate::engine::animation::{CharacterVisual, ExistingColorHandling, VisualParams};
 use crate::engine::character::CharId;
-use crate::engine::ctx::{EffectHooks, EngineCtx};
+use crate::engine::ctx::{Clock, EffectHooks, EngineCtx};
 use crate::engine::effect::Effect;
 use crate::engine::error::EngineError;
 use crate::engine::events::{CallerKey, EffectCallback, Event, EventAction};
@@ -75,11 +76,115 @@ pub struct ColorShift {
     config: ColorShiftConfig,
     character_final_color_map: HashMap<CharId, Color>,
     loop_tracker_map: HashMap<CharId, i64>,
+    cli_frames: Option<CachedFrames>,
+}
+
+#[derive(Default)]
+struct CachedFrames {
+    gradient: Vec<Rc<String>>,
+    final_gradient: Vec<Rc<String>>,
+    tick: u64,
+    cycle_ticks: u64,
+    gradient_ticks: u64,
+    total_ticks: u64,
 }
 
 impl ColorShift {
     pub fn new(config: ColorShiftConfig) -> Self {
-        ColorShift { config, character_final_color_map: HashMap::new(), loop_tracker_map: HashMap::new() }
+        ColorShift { config, character_final_color_map: HashMap::new(), loop_tracker_map: HashMap::new(), cli_frames: None }
+    }
+
+    /// The CLI owns its context for the whole run; callers of `new` retain
+    /// the ordinary per-frame, inspectable scene playback state.
+    #[doc(hidden)]
+    pub fn for_cli(config: ColorShiftConfig) -> Self {
+        let mut effect = Self::new(config);
+        effect.cli_frames = Some(CachedFrames::default());
+        effect
+    }
+
+    fn cache_frames(&self, ctx: &mut EngineCtx, len: usize) -> Option<CachedFrames> {
+        const MAX_CACHE_BYTES: usize = 32 << 20;
+        let duration = u64::try_from(self.config.gradient_frames).ok()?;
+        let cycles = u64::try_from(self.config.cycles).ok()?;
+        let cycle_ticks = u64::try_from(len).ok()?.checked_mul(duration)?;
+        let gradient_ticks = cycle_ticks.checked_mul(cycles)?;
+        if cycle_ticks == 0 || cycles == 0 {
+            return None;
+        }
+        let characters = ctx.terminal.input_characters.clone();
+        let final_len = if self.config.skip_final_gradient {
+            0
+        } else {
+            characters
+                .iter()
+                .map(|&id| ctx.terminal.arena[id.0 as usize].animation.scenes.get("final_gradient").unwrap().all_frames.len())
+                .max()
+                .unwrap_or(0)
+        };
+        let total_ticks = gradient_ticks.checked_add(u64::try_from(final_len).ok()?.checked_mul(duration)?)?;
+        // Cache only bounded canvases/gradients; large custom configurations
+        // keep the ordinary engine rather than retaining huge formatted frames.
+        let cells = (ctx.terminal.visible_right.max(0) as usize)
+            .checked_mul(ctx.terminal.visible_top.max(0) as usize)?;
+        if len.checked_add(final_len)? > 512 || cells.checked_mul(len + final_len)? > 8_000_000 {
+            return None;
+        }
+        let mut program = CachedFrames {
+            gradient: Vec::with_capacity(len),
+            final_gradient: Vec::with_capacity(final_len),
+            tick: 0,
+            cycle_ticks,
+            gradient_ticks,
+            total_ticks,
+        };
+        let restore_initial = |ctx: &mut EngineCtx| {
+            for &id in &characters {
+                let ch = &mut ctx.terminal.arena[id.0 as usize];
+                ch.animation.current_character_visual =
+                    ch.animation.scenes.get("gradient").unwrap().all_frames[0].character_visual.clone();
+            }
+        };
+        let mut cached_bytes = 0usize;
+        for index in 0..len {
+            for &id in &characters {
+                let ch = &mut ctx.terminal.arena[id.0 as usize];
+                ch.animation.current_character_visual =
+                    ch.animation.scenes.get("gradient").unwrap().all_frames[index].character_visual.clone();
+            }
+            let frame = ctx.terminal.get_formatted_output_string();
+            if let Some(previous) = program.gradient.last().filter(|previous| previous.as_str() == frame.as_str()) {
+                program.gradient.push(Rc::clone(previous));
+            } else {
+                if cached_bytes.saturating_add(frame.capacity()) > MAX_CACHE_BYTES {
+                    restore_initial(ctx);
+                    return None;
+                }
+                cached_bytes += frame.capacity();
+                program.gradient.push(Rc::new(frame));
+            }
+        }
+        for index in 0..final_len {
+            for &id in &characters {
+                let ch = &mut ctx.terminal.arena[id.0 as usize];
+                let scene = ch.animation.scenes.get("final_gradient").unwrap();
+                let frame = index.min(scene.all_frames.len() - 1);
+                ch.animation.current_character_visual = scene.all_frames[frame].character_visual.clone();
+            }
+            let frame = ctx.terminal.get_formatted_output_string();
+            let previous = program.final_gradient.last().or_else(|| program.gradient.last());
+            if let Some(previous) = previous.filter(|previous| previous.as_str() == frame.as_str()) {
+                program.final_gradient.push(Rc::clone(previous));
+            } else {
+                if cached_bytes.saturating_add(frame.capacity()) > MAX_CACHE_BYTES {
+                    restore_initial(ctx);
+                    return None;
+                }
+                cached_bytes += frame.capacity();
+                program.final_gradient.push(Rc::new(frame));
+            }
+        }
+        Some(program)
     }
 }
 
@@ -126,6 +231,8 @@ impl Effect for ColorShift {
             Gradient::new(&self.config.gradient_stops, &self.config.gradient_steps, false, !self.config.no_loop)
                 .map_err(EngineError::Other)?;
         let dynamic = ctx.terminal.config.existing_color_handling == ExistingColorHandling::Dynamic;
+        let always = ctx.terminal.config.existing_color_handling == ExistingColorHandling::Always;
+        let mut visual_cache: HashMap<String, Vec<Rc<CharacterVisual>>> = HashMap::new();
         let characters = {
             let filter = CharacterFilter::default();
             ctx.terminal.get_characters(&mut ctx.rng, filter, CharacterSort::TopToBottomLeftToRight)
@@ -142,8 +249,8 @@ impl Effect for ColorShift {
                     ch.uses_input_preexisting_colors,
                 )
             };
-            let colors: Vec<Color> = if self.config.no_travel {
-                gradient.spectrum.clone()
+            let k = if self.config.no_travel {
+                0
             } else {
                 let direction_index = match self.config.travel_direction {
                     GradientDirection::Horizontal => {
@@ -175,29 +282,53 @@ impl Effect for ColorShift {
                 } else {
                     shift_distance.min(len) as usize
                 };
-                let mut rotated = gradient.spectrum[k..].to_vec();
-                rotated.extend_from_slice(&gradient.spectrum[..k]);
-                rotated
+                k
             };
             {
                 let ch = &mut ctx.terminal.arena[id.0 as usize];
                 ch.animation.new_scene(false, None, None, "gradient", uses_pre);
                 let scene = ch.animation.scenes.get_mut("gradient").unwrap();
-                for color in &colors {
-                    scene
-                        .add_frame(
-                            &input_symbol,
-                            self.config.gradient_frames,
-                            VisualParams {
-                                colors: Some(ColorPair::new(Some(color.clone()), None)),
-                                ..Default::default()
-                            },
-                        )
-                        .map_err(EngineError::Other)?;
+                let cached = if always && uses_pre {
+                    None
+                } else {
+                    if !visual_cache.contains_key(&input_symbol) {
+                        let visuals = gradient
+                            .spectrum
+                            .iter()
+                            .map(|color| {
+                                scene.frame_visual(
+                                    &input_symbol,
+                                    VisualParams {
+                                        colors: Some(ColorPair::new(Some(*color), None)),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect();
+                        visual_cache.insert(input_symbol.clone(), visuals);
+                    }
+                    visual_cache.get(&input_symbol)
+                };
+                for index in (k..gradient.spectrum.len()).chain(0..k) {
+                    if let Some(visuals) = cached {
+                        scene.add_frame_visual(Rc::clone(&visuals[index]), self.config.gradient_frames)
+                            .map_err(EngineError::Other)?;
+                    } else {
+                        scene
+                            .add_frame(
+                                &input_symbol,
+                                self.config.gradient_frames,
+                                VisualParams {
+                                    colors: Some(ColorPair::new(Some(gradient.spectrum[index]), None)),
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(EngineError::Other)?;
+                    }
                 }
                 ch.animation.new_scene(false, None, None, "final_gradient", uses_pre);
             }
-            let last_color = colors.last().unwrap().clone();
+            let last_color = *gradient.spectrum[..k].last().or_else(|| gradient.spectrum.last()).unwrap();
             if dynamic {
                 let fg_gradient = match &input_fg {
                     Some(c) => Some(
@@ -262,10 +393,44 @@ impl Effect for ColorShift {
             )
             .map_err(EngineError::Other)?;
         }
+        if self.cli_frames.is_some() {
+            self.cli_frames = self.cache_frames(ctx, gradient.spectrum.len());
+        }
         Ok(())
     }
 
     fn next_frame(&mut self, ctx: &mut EngineCtx) -> Option<String> {
+        if let Some(program) = &mut self.cli_frames {
+            let tick = program.tick;
+            if tick >= program.total_ticks {
+                return None;
+            }
+            let duration = self.config.gradient_frames as u64;
+            let frame = if tick < program.gradient_ticks {
+                if tick % program.cycle_ticks == program.cycle_ticks - 1 {
+                    if tick + 1 == program.gradient_ticks {
+                        if self.config.skip_final_gradient {
+                            &program.gradient[program.gradient.len() - 1]
+                        } else {
+                            &program.final_gradient[0]
+                        }
+                    } else {
+                        &program.gradient[0]
+                    }
+                } else {
+                    &program.gradient[((tick % program.cycle_ticks) / duration) as usize]
+                }
+            } else {
+                let index = ((tick - program.gradient_ticks) / duration) as usize;
+                &program.final_gradient[index.min(program.final_gradient.len() - 1)]
+            };
+            program.tick += 1;
+            if matches!(ctx.clock, Clock::Real { .. }) && ctx.terminal.config.frame_rate != 0 {
+                ctx.terminal.enforce_framerate();
+            }
+            ctx.clock.advance_frame();
+            return Some(frame.as_ref().clone());
+        }
         if !ctx.active_characters.is_empty() {
             ctx.update(self);
             return Some(ctx.frame());

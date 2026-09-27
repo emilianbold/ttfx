@@ -180,7 +180,13 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        let mut effect = effect_command.build_effect();
+        let mut effect: Box<dyn engine::effect::Effect> = match effect_command {
+            ttfx::effects::EffectCommand::Colorshift(colorshift)
+                if !cli.parity_dump || cli.max_frames.is_none() => {
+                    Box::new(ttfx::effects::colorshift::ColorShift::for_cli(colorshift.clone()))
+            }
+            _ => effect_command.build_effect(),
+        };
 
         let outcome = if cli.parity_dump {
             ttfx::engine::effect::dump_effect(effect.as_mut(), &mut ctx, cli.max_frames)
